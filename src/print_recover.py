@@ -6,30 +6,61 @@
 import json
 import logging
 import os
-import tempfile
 import time
 
 
 def atomic_write_json(path, data):
-    """Write JSON atomically (temp file in same dir + rename)."""
+    """Overwrite JSON atomically via a single fixed *.tmp next to the target.
+
+    Uses one stable temp name (not mkstemp) so interrupted flushes cannot
+    pile up unique leftover files in the config directory.
+    """
     directory = os.path.dirname(path) or '.'
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
-    fd, tmp = tempfile.mkstemp(prefix='.print_recover_', suffix='.tmp',
-                               dir=directory)
+    tmp = path + '.tmp'
     try:
-        with os.fdopen(fd, 'w') as f:
+        with open(tmp, 'w') as f:
             json.dump(data, f, indent=2, sort_keys=True)
             f.write('\n')
             f.flush()
             os.fsync(f.fileno())
-        os.rename(tmp, path)
+        os.replace(tmp, path)  # atomic overwrite of the single state file
     except Exception:
         try:
-            os.unlink(tmp)
+            if os.path.isfile(tmp):
+                os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def cleanup_stale_state_temps(state_path):
+    """Remove leftover temp/state junk from older builds or crashed flushes."""
+    directory = os.path.dirname(state_path) or '.'
+    base = os.path.basename(state_path)
+    removed = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    for name in names:
+        # Legacy mkstemp leftovers: .print_recover_XXXXXX.tmp
+        # Fixed temp: print_recover_state.json.tmp
+        if name.startswith('.print_recover_') and name.endswith('.tmp'):
+            pass
+        elif name == base + '.tmp':
+            pass
+        elif name.startswith(base + '.') and name.endswith('.tmp'):
+            pass
+        else:
+            continue
+        try:
+            os.unlink(os.path.join(directory, name))
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def load_json(path):
@@ -180,15 +211,89 @@ def find_start_print_line(gcode_path, max_bytes=512 * 1024):
     return None
 
 
+def _parse_e_from_gcode_line(line):
+    """Return E value from a G0/G1/G92 line, or None."""
+    if not line:
+        return None
+    # strip comments
+    if ';' in line:
+        line = line[:line.index(';')]
+    parts = line.strip().split()
+    if not parts:
+        return None
+    cmd = parts[0].upper()
+    if cmd not in ('G0', 'G00', 'G1', 'G01', 'G92'):
+        return None
+    for tok in parts[1:]:
+        if tok.upper().startswith('E'):
+            try:
+                return float(tok[1:])
+            except ValueError:
+                return None
+    return None
+
+
+def infer_resume_e(src_path, file_position, saved_e=0.0, max_lines=400):
+    """Pick a G92 E value that matches the upcoming gcode (avoid huge E jumps).
+
+    Slicers often G92 E0 each layer. Blindly restoring a large saved E then
+    hitting G1 E0 triggers max_extrude_only_distance. We peek ahead:
+      - G92 E… before extrusion → use that
+      - first G0/G1 with E → use that E (so the move delta is ~0)
+      - else → 0.0 (safe default)
+    """
+    file_position = max(0, int(file_position))
+    try:
+        with open(src_path, 'rb') as f:
+            if file_position > 0:
+                f.seek(file_position - 1)
+                prev = f.read(1)
+                if prev not in (b'\n', b'\r'):
+                    f.readline()
+                else:
+                    f.seek(file_position)
+            for _ in range(max_lines):
+                raw = f.readline()
+                if not raw:
+                    break
+                line = raw.decode('utf-8', errors='replace').strip()
+                if not line or line.startswith(';'):
+                    continue
+                upper = line.split(';', 1)[0].strip().upper()
+                if upper.startswith('G92'):
+                    e = _parse_e_from_gcode_line(line)
+                    if e is not None:
+                        return e, 'g92'
+                    continue
+                if upper.startswith('G0') or upper.startswith('G1'):
+                    e = _parse_e_from_gcode_line(line)
+                    if e is not None:
+                        return e, 'next_move'
+    except OSError:
+        pass
+    # Last resort: only trust saved_e if small (typical post-G92 layer window)
+    try:
+        saved_e = float(saved_e or 0.0)
+    except (TypeError, ValueError):
+        saved_e = 0.0
+    if 0.0 <= saved_e <= 50.0:
+        return saved_e, 'saved_small'
+    return 0.0, 'fallback_zero'
+
+
 def build_resume_preamble(state, z_hop=5.0, home_xy=True, platform='generic',
-                          default_mesh_profile='', default_skew_profile=''):
+                          default_mesh_profile='', default_skew_profile='',
+                          resume_e=None):
     """G-code lines to restore temps / fans / XYZ before continuing the file."""
     pos = state.get('position') or {}
     gpos = state.get('gcode_position') or pos
     x = float(gpos.get('x', pos.get('x', 0.0)))
     y = float(gpos.get('y', pos.get('y', 0.0)))
     z = float(gpos.get('z', pos.get('z', 0.0)))
-    e = float(gpos.get('e', pos.get('e', 0.0)))
+    if resume_e is None:
+        e = 0.0
+    else:
+        e = float(resume_e)
     bed = state.get('bed') or {}
     extruder = state.get('extruder') or {}
     fan = state.get('fan') or {}
@@ -268,8 +373,10 @@ def build_resume_preamble(state, z_hop=5.0, home_xy=True, platform='generic',
     lines.append('G0 Z%.3f F600' % (z + max(0.0, z_hop),))
     lines.append('G0 X%.3f Y%.3f F6000' % (x, y))
     lines.append('G0 Z%.3f F300' % (z,))
-    lines.append('G92 E%.5f' % (e,))
+    # Match upcoming file E (never blind-restore huge absolute E — causes
+    # "Extrude only move too long" when the slicer resets with G92 E0 / G1 E0)
     lines.append('M82')
+    lines.append('G92 E%.5f' % (e,))
     if fan_speed and fan_speed > 0:
         lines.append('M106 S%d' % (int(max(0, min(255, round(fan_speed * 255)))),))
     else:
@@ -402,6 +509,14 @@ class PrintRecover:
         self.toolhead = self.printer.lookup_object('toolhead')
 
     def _handle_ready(self):
+        try:
+            n = cleanup_stale_state_temps(self.state_path)
+            if n:
+                logging.info(
+                    "print_recover: removed %d stale temp state file(s)", n
+                )
+        except Exception:
+            logging.exception("print_recover: temp cleanup failed")
         if self.track_moves and self.next_transform is None:
             self.next_transform = self.gcode_move.set_move_transform(
                 self, force=True
@@ -839,6 +954,18 @@ class PrintRecover:
         else:
             offset = int(state.get('file_position') or 0)
 
+        saved_e = 0.0
+        try:
+            gpos = state.get('gcode_position') or state.get('position') or {}
+            saved_e = float(gpos.get('e', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            saved_e = 0.0
+        resume_e, e_src = infer_resume_e(src, offset, saved_e=saved_e)
+        logging.info(
+            "print_recover: resume E=%.5f (source=%s, saved_e=%.5f)",
+            resume_e, e_src, saved_e
+        )
+
         preamble = build_resume_preamble(
             state,
             z_hop=self.z_hop_on_resume,
@@ -846,6 +973,7 @@ class PrintRecover:
             platform=self.platform,
             default_mesh_profile=self.default_mesh_profile,
             default_skew_profile=self.default_skew_profile,
+            resume_e=resume_e,
         )
         if self.before_resume_gcode:
             # insert after header comment block
@@ -853,7 +981,8 @@ class PrintRecover:
 
         base = os.path.basename(src)
         root, ext = os.path.splitext(base)
-        out_name = 'RECOVER-%s-%s%s' % (mode, root, ext or '.gcode')
+        # Single reusable name per source file (overwrite, do not accumulate)
+        out_name = 'RECOVER-%s%s' % (root, ext or '.gcode')
         out_path = os.path.join(os.path.dirname(src), out_name)
         write_resume_gcode(src, out_path, offset, preamble)
         return {

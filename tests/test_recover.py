@@ -12,8 +12,10 @@ sys.path.insert(0, ROOT)
 from print_recover import (  # noqa: E402
     atomic_write_json,
     build_resume_preamble,
+    cleanup_stale_state_temps,
     find_layer_resume_offset,
     find_start_print_line,
+    infer_resume_e,
     load_json,
     parse_start_print_params,
     write_resume_gcode,
@@ -74,6 +76,25 @@ class TestAtomicAndResumeFile(unittest.TestCase):
         atomic_write_json(path, {'a': 1, 'b': [1, 2]})
         data = load_json(path)
         self.assertEqual(data['a'], 1)
+        # overwrite in place — still one file
+        atomic_write_json(path, {'a': 2})
+        self.assertEqual(load_json(path)['a'], 2)
+        names = [n for n in os.listdir(d) if 'state' in n]
+        self.assertEqual(names, ['state.json'])
+        os.unlink(path)
+        os.rmdir(d)
+
+    def test_cleanup_stale_temps(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'print_recover_state.json')
+        open(os.path.join(d, '.print_recover_abc123.tmp'), 'w').close()
+        open(path + '.tmp', 'w').close()
+        with open(path, 'w') as f:
+            f.write('{}')
+        n = cleanup_stale_state_temps(path)
+        self.assertGreaterEqual(n, 2)
+        self.assertTrue(os.path.isfile(path))
+        self.assertFalse(os.path.isfile(path + '.tmp'))
         os.unlink(path)
         os.rmdir(d)
 
@@ -98,7 +119,9 @@ class TestAtomicAndResumeFile(unittest.TestCase):
             'speed_factor': 1.0,
             'extrude_factor': 1.0,
         }
-        preamble = build_resume_preamble(state, z_hop=5, home_xy=True)
+        preamble = build_resume_preamble(
+            state, z_hop=5, home_xy=True, resume_e=0.0
+        )
         write_resume_gcode(src, dst, pos, preamble)
         with open(dst, 'r') as f:
             out = f.read()
@@ -140,6 +163,35 @@ class TestAtomicAndResumeFile(unittest.TestCase):
         self.assertIn('EXTRUDER_TEMP=210.0', joined)  # other-layer temp
         self.assertNotIn('BED_MESH_CALIBRATE', joined)
         self.assertIn('SET_KINEMATIC_POSITION Z=3.000', joined)
+
+
+class TestInferResumeE(unittest.TestCase):
+    def test_uses_upcoming_g92_e0(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 't.gcode')
+        body = 'G1 X1 E50\nG92 E0\nG1 X2 E1.5\n'
+        with open(path, 'w') as f:
+            f.write(body)
+        e, src = infer_resume_e(path, 0, saved_e=999.0)
+        self.assertEqual(src, 'next_move')
+        self.assertAlmostEqual(e, 50.0)
+        # from after first line → hit G92 E0
+        e2, src2 = infer_resume_e(path, body.index('G92'), saved_e=999.0)
+        self.assertEqual(src2, 'g92')
+        self.assertAlmostEqual(e2, 0.0)
+        os.unlink(path)
+        os.rmdir(d)
+
+    def test_rejects_huge_saved_e(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 't.gcode')
+        with open(path, 'w') as f:
+            f.write('; only comments\n')
+        e, src = infer_resume_e(path, 0, saved_e=1115.0)
+        self.assertEqual(src, 'fallback_zero')
+        self.assertEqual(e, 0.0)
+        os.unlink(path)
+        os.rmdir(d)
 
 
 class TestStartPrintParse(unittest.TestCase):
