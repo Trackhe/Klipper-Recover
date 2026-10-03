@@ -1,0 +1,49 @@
+# print_recover — resume after MCU disconnect / Klipper restart
+# Include from printer.cfg:
+#   [include print_recover.cfg]
+# RatOS users also:
+#   [include print_recover_ratos.cfg]
+#
+# Slicer: in "After layer change" / "Layer change" G-code add:
+#   RECOVER_LAYER LAYER=[layer_num] Z=[layer_z]
+# (Orca/Prusa placeholders; adjust to your slicer)
+
+[print_recover]
+enabled: True
+
+# generic | ratos
+# ratos → resume fires RECOVER_START_PRINT (mesh+skew load, is_printing_gcode=True, no calib)
+platform: ratos
+
+# Fallbacks if live profile cannot be read (your setup uses my_skew_profile)
+mesh_profile: ratos
+skew_profile: my_skew_profile
+
+# JSON state file (atomic writes). Keep on the Pi SSD, not a network share.
+state_path: ~/printer_data/config/print_recover_state.json
+
+# Live state lives in RAM (every move when track_moves=True).
+# Periodic SSD flush — cheap; stale by at most this interval on hard kill / Pi power loss.
+# Klipper crash/restart usually still hits save_on_shutdown and flushes RAM immediately.
+# 0 = no timer (layer / manual / shutdown only).
+save_interval: 30.0
+
+# Update XYZ in memory on every G-code move (cheap; disk flush still interval-based)
+track_moves: True
+
+# Flush immediately on RECOVER_LAYER from the slicer
+save_on_layer: True
+
+# Force flush on klippy shutdown / disconnect (best case for "only Klipper died")
+save_on_shutdown: True
+
+# Resume preamble
+z_hop_on_resume: 5.0
+resume_xy_home: True
+
+# Ignore tiny offsets (still in start gcode)
+min_file_position: 0
+
+# Optional extra lines injected at the top of the resume file
+# before_resume_gcode:
+#     M117 custom hook

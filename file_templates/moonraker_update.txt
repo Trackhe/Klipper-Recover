@@ -1,0 +1,11 @@
+# Template — install.sh normally writes this with the real path/origin.
+
+[update_manager print_recover]
+type: git_repo
+path: ~/Klipper-Recover
+origin: https://github.com/Trackhe/Klipper-Recover.git
+primary_branch: main
+is_system_service: False
+managed_services: klipper
+info_tags:
+  desc=Klipper print recovery (disconnect / power-loss resume)
